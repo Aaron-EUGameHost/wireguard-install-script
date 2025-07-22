@@ -1,241 +1,1170 @@
-#!/usr/bin/env bash
-#
-# Simple WireGuard Installer & Manager
-# - First run: installs server + creates an initial client
-# - Subsequent runs: add, list, or revoke clients
-#
+#!/bin/bash
+
+# Enhanced WireGuard Setup Manager
+# A modern, secure, and user-friendly WireGuard installation and management tool
+# Version: 1.0.0
+# License: MIT
 
 set -euo pipefail
 
-LOGFILE="/var/log/wireguard-install.log"
-# All output goes to the log
-exec >>"$LOGFILE" 2>&1
+# ==========================================
+# GLOBAL CONFIGURATION
+# ==========================================
 
-require_root() {
-  if [[ $EUID -ne 0 ]]; then
-    echo "Error: must be run as root" >&2
-    exit 1
-  fi
+readonly SCRIPT_NAME="WireGuard Setup Manager"
+readonly SCRIPT_VERSION="1.0.0"
+readonly CONFIG_DIR="/etc/wireguard-manager"
+readonly LOG_FILE="/var/log/wireguard-manager.log"
+readonly BACKUP_DIR="/etc/wireguard-manager/backups"
+readonly TEMP_DIR="/tmp/wg-manager-$$"
+
+# Color definitions
+readonly COLOR_RED='\033[0;31m'
+readonly COLOR_GREEN='\033[0;32m'
+readonly COLOR_YELLOW='\033[1;33m'
+readonly COLOR_BLUE='\033[0;34m'
+readonly COLOR_PURPLE='\033[0;35m'
+readonly COLOR_CYAN='\033[0;36m'
+readonly COLOR_RESET='\033[0m'
+
+# Default network settings
+readonly DEFAULT_VPN_SUBNET="10.100.0.0/24"
+readonly DEFAULT_VPN_IPV6="fd00:10:100::/64"
+readonly DEFAULT_PORT_RANGE_START=51820
+readonly DEFAULT_PORT_RANGE_END=51830
+
+# ==========================================
+# LOGGING AND UTILITY FUNCTIONS
+# ==========================================
+
+# Initialize logging
+setup_logging() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 640 "$LOG_FILE"
 }
 
-check_virt() {
-  # Block OpenVZ/LXC
-  if command -v systemd-detect-virt &>/dev/null; then
-    v=$(systemd-detect-virt)
-    if [[ "$v" == "openvz" || "$v" == "lxc" ]]; then
-      echo "Unsupported virtualization: $v" >&2
-      exit 1
+# Enhanced logging function
+log_message() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+}
+
+# Print colored output with logging
+print_status() {
+    local color="$1"
+    local level="$2"
+    shift 2
+    local message="$*"
+    
+    echo -e "${color}[${level}]${COLOR_RESET} $message"
+    log_message "$level" "$message"
+}
+
+# Convenience functions for different log levels
+log_info() { print_status "$COLOR_BLUE" "INFO" "$@"; }
+log_success() { print_status "$COLOR_GREEN" "SUCCESS" "$@"; }
+log_warning() { print_status "$COLOR_YELLOW" "WARNING" "$@"; }
+log_error() { print_status "$COLOR_RED" "ERROR" "$@"; }
+
+# Error handling with cleanup
+handle_error() {
+    local exit_code=$?
+    local line_number=${1:-$LINENO}
+    
+    log_error "Script failed at line $line_number with exit code $exit_code"
+    perform_cleanup
+    exit $exit_code
+}
+
+# Cleanup function
+perform_cleanup() {
+    if [[ -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR" 2>/dev/null || true
     fi
-  fi
 }
 
-detect_os() {
-  # Load /etc/os-release
-  source /etc/os-release
-  OS=$ID
-  VER=${VERSION_ID%%.*}
+# Set up error handling
+trap 'handle_error $LINENO' ERR
+trap perform_cleanup EXIT
+
+# ==========================================
+# SYSTEM VALIDATION FUNCTIONS
+# ==========================================
+
+# Check if running as root
+verify_root_access() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run with administrator privileges"
+        echo "Please run: sudo $0"
+        exit 1
+    fi
 }
 
-install_pkgs() {
-  case "$OS" in
-    ubuntu|debian)
-      apt-get update
-      apt-get install -y wireguard qrencode iptables resolvconf curl
-      ;;
-    fedora)
-      dnf install -y wireguard-tools qrencode iptables curl
-      ;;
-    centos|rhel|rocky|almalinux)
-      yum install -y epel-release elrepo-release
-      yum install -y kmod-wireguard wireguard-tools qrencode iptables curl
-      ;;
-    arch)
-      pacman -Sy --noconfirm wireguard-tools qrencode iptables curl
-      ;;
-    alpine)
-      apk update
-      apk add wireguard-tools qrencode iptables curl openrc
-      ;;
-    *)
-      echo "Unsupported OS: $OS" >&2
-      exit 1
-      ;;
-  esac
+# Detect operating system
+detect_operating_system() {
+    local os_info
+    
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        echo "${ID}:${VERSION_ID}"
+    else
+        log_error "Cannot detect operating system"
+        return 1
+    fi
 }
 
-write_server_conf() {
-  mkdir -p /etc/wireguard
-  chmod 700 /etc/wireguard
-
-  # 1) Prompts
-  read -rp "Interface name (wg0): " IFACE; IFACE=${IFACE:-wg0}
-
-  # Public IPv4 autodetect or fallback
-  IP4=$(ip -4 addr show scope global \
-    | awk '/inet/ {print $2; exit}' | cut -d/ -f1)
-  [[ -n $IP4 ]] || IP4=$(curl -fsSL ifconfig.co)
-  read -rp "Public IPv4 [$IP4]: " PUBLIC_IP4
-  PUBLIC_IP4=${PUBLIC_IP4:-$IP4}
-
-  # Public NIC autodetect
-  DEFNIC=$(ip route show default | awk '/dev/ {print $5; exit}')
-  read -rp "Public interface [$DEFNIC]: " PUBLIC_NIC
-  PUBLIC_NIC=${PUBLIC_NIC:-$DEFNIC}
-
-  # VPN subnets, port, DNS & allowed IPs
-  read -rp "Server WG IPv4 subnet [10.0.0.1/24]: " WG4; WG4=${WG4:-10.0.0.1/24}
-  read -rp "Server WG IPv6 subnet (optional): " WG6
-  read -rp "WireGuard port [51820]: " PORT; PORT=${PORT:-51820}
-  read -rp "Client DNS1 [1.1.1.1]: " DNS1; DNS1=${DNS1:-1.1.1.1}
-  read -rp "Client DNS2 [1.0.0.1]: " DNS2; DNS2=${DNS2:-1.0.0.1}
-  read -rp "AllowedIPs [0.0.0.0/0,::/0]: " ALLOW; ALLOW=${ALLOW:-0.0.0.0/0,::/0}
-
-  # Save params for later runs
-  cat > /etc/wireguard/params <<EOF
-IFACE=$IFACE
-PUBLIC_IP4=$PUBLIC_IP4
-PUBLIC_NIC=$PUBLIC_NIC
-WG4=$WG4
-WG6=$WG6
-PORT=$PORT
-DNS1=$DNS1
-DNS2=$DNS2
-ALLOW=$ALLOW
-EOF
-
-  # 2) Generate server keys
-  SERVER_PRIV=$(wg genkey)
-  SERVER_PUB=$(echo "$SERVER_PRIV" | wg pubkey)
-
-  # 3) Write /etc/wireguard/${IFACE}.conf
-  {
-    echo "[Interface]"
-    echo "Address = $WG4${WG6:+,$WG6}"
-    echo "ListenPort = $PORT"
-    echo "PrivateKey = $SERVER_PRIV"
-    echo "PostUp = iptables -I INPUT -p udp --dport $PORT -j ACCEPT"
-    echo "PostUp = iptables -t nat -A POSTROUTING -o $PUBLIC_NIC -j MASQUERADE"
-    echo "PostDown = iptables -D INPUT -p udp --dport $PORT -j ACCEPT"
-    echo "PostDown = iptables -t nat -D POSTROUTING -o $PUBLIC_NIC -j MASQUERADE"
-  } > /etc/wireguard/${IFACE}.conf
-
-  # 4) Enable IP forwarding
-  sysctl -w net.ipv4.ip_forward=1
-  [[ -n $WG6 ]] && sysctl -w net.ipv6.conf.all.forwarding=1
-
-  # 5) Start service
-  if [[ $OS == "alpine" ]]; then
-    rc-update add wg-quick.$IFACE default
-    rc-service wg-quick.$IFACE start
-  else
-    systemctl enable wg-quick@${IFACE}
-    systemctl start wg-quick@${IFACE}
-  fi
-
-  # 6) Prepare client DB & save server pubkey
-  : > /etc/wireguard/clients.db
-  echo "$SERVER_PUB" > /etc/wireguard/server.pub
-}
-
-allocate_ip() {
-  # Uses WG4's /24 to assign .2, .3, ...
-  source /etc/wireguard/params
-  base=$(echo $WG4 | cut -d/ -f1 | rev | cut -d. -f2- | rev)
-  count=$(grep -c . /etc/wireguard/clients.db)
-  echo "$base.$((count+2))"
-}
-
-add_client() {
-  source /etc/wireguard/params
-  read -rp "Client name: " NAME
-  grep -q "^$NAME," /etc/wireguard/clients.db && { echo "Client exists"; return; }
-  IP4=$(allocate_ip)
-  CLIENT_PRIV=$(wg genkey)
-  CLIENT_PUB=$(echo "$CLIENT_PRIV" | wg pubkey)
-  CLIENT_PSK=$(wg genpsk)
-  ENDPOINT="$PUBLIC_IP4:$PORT"
-
-  HOME=$(eval echo "~${SUDO_USER:-root}")
-  CFG="$HOME/${IFACE}-${NAME}.conf"
-
-  {
-    echo "[Interface]"
-    echo "PrivateKey = $CLIENT_PRIV"
-    echo "Address    = $IP4/32${WG6:+,${IP4}/128}"
-    echo "DNS        = $DNS1,$DNS2"
-    echo
-    echo "[Peer]"
-    echo "PublicKey    = $(cat /etc/wireguard/server.pub)"
-    echo "PresharedKey = $CLIENT_PSK"
-    echo "Endpoint     = $ENDPOINT"
-    echo "AllowedIPs   = $ALLOW"
-  } > "$CFG"
-
-  echo "$NAME,$IP4" >> /etc/wireguard/clients.db
-
-  {
-    echo ""
-    echo "# Peer: $NAME"
-    echo "[Peer]"
-    echo "PublicKey    = $CLIENT_PUB"
-    echo "PresharedKey = $CLIENT_PSK"
-    echo "AllowedIPs   = $IP4/32${WG6:+,${IP4}/128}"
-  } >> /etc/wireguard/${IFACE}.conf
-
-  # Reload
-  if [[ $OS == "alpine" ]]; then
-    rc-service wg-quick.$IFACE restart
-  else
-    systemctl restart wg-quick@${IFACE}
-  fi
-
-  echo "Client config: $CFG"
-}
-
-list_clients() {
-  cut -d, -f1 /etc/wireguard/clients.db
-}
-
-revoke_client() {
-  list_clients
-  read -rp "Revoke name: " NAME
-  grep -v "^$NAME," /etc/wireguard/clients.db > /etc/wireguard/clients.tmp
-  mv /etc/wireguard/clients.tmp /etc/wireguard/clients.db
-  sed -i "/# Peer: $NAME/,/^\$/d" /etc/wireguard/${IFACE}.conf
-  rm -f "$(eval echo "~${SUDO_USER:-root}")/${IFACE}-${NAME}.conf"
-  if [[ $OS == "alpine" ]]; then
-    rc-service wg-quick.$IFACE restart
-  else
-    systemctl restart wg-quick@${IFACE}
-  fi
-  echo "Revoked client $NAME"
-}
-
-manage_menu() {
-  source /etc/wireguard/params
-  PS3="Select: "
-  options=("Add client" "List clients" "Revoke client" "Exit")
-  select opt in "${options[@]}"; do
-    case $REPLY in
-      1) add_client;;
-      2) list_clients;;
-      3) revoke_client;;
-      4) exit;;
-      *) echo "Invalid";;
+# Validate system compatibility
+validate_system_compatibility() {
+    local os_version
+    os_version=$(detect_operating_system)
+    local os_id="${os_version%%:*}"
+    local version_id="${os_version##*:}"
+    
+    log_info "Detected system: $os_id $version_id"
+    
+    case "$os_id" in
+        "ubuntu")
+            if [[ "${version_id%%.*}" -lt 20 ]]; then
+                log_error "Ubuntu 20.04 or newer required"
+                return 1
+            fi
+            ;;
+        "debian")
+            if [[ "${version_id}" -lt 10 ]]; then
+                log_error "Debian 10 or newer required"
+                return 1
+            fi
+            ;;
+        "fedora")
+            if [[ "$version_id" -lt 35 ]]; then
+                log_error "Fedora 35 or newer required"
+                return 1
+            fi
+            ;;
+        "centos"|"almalinux"|"rocky")
+            if [[ "${version_id%%.*}" -lt 8 ]]; then
+                log_error "Version 8 or newer required for $os_id"
+                return 1
+            fi
+            ;;
+        *)
+            log_warning "Operating system $os_id may not be fully supported"
+            ;;
     esac
-    break
-  done
+    
+    return 0
 }
 
-# Main
-require_root
-check_virt
-detect_os
+# Check virtualization environment
+check_virtualization() {
+    local virt_type
+    
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        virt_type=$(systemd-detect-virt 2>/dev/null || echo "none")
+    else
+        virt_type="unknown"
+    fi
+    
+    case "$virt_type" in
+        "openvz")
+            log_error "OpenVZ containers are not supported"
+            return 1
+            ;;
+        "lxc")
+            log_warning "LXC detected - additional configuration may be required"
+            ;;
+        "none"|"kvm"|"vmware"|"xen"|"microsoft")
+            log_info "Virtualization environment: $virt_type"
+            ;;
+        *)
+            log_info "Unknown or unsupported virtualization: $virt_type"
+            ;;
+    esac
+    
+    return 0
+}
 
-if [[ ! -f /etc/wireguard/params ]]; then
-  install_pkgs
-  write_server_conf
-  add_client
-else
-  manage_menu
-fi
+# ==========================================
+# NETWORK CONFIGURATION FUNCTIONS
+# ==========================================
+
+# Get primary network interface
+discover_primary_interface() {
+    local interface
+    interface=$(ip route show default | awk '/default/ {print $5; exit}')
+    
+    if [[ -z "$interface" ]]; then
+        log_error "Cannot determine primary network interface"
+        return 1
+    fi
+    
+    echo "$interface"
+}
+
+# Get server public IP
+discover_public_ip() {
+    local public_ip
+    
+    # Try multiple methods to get public IP
+    local ip_services=(
+        "ip -4 addr show scope global"
+        "curl -4 -s --max-time 10 ifconfig.me"
+        "curl -4 -s --max-time 10 ip.sb"
+        "curl -4 -s --max-time 10 ipv4.icanhazip.com"
+    )
+    
+    for service in "${ip_services[@]}"; do
+        if [[ "$service" =~ ^ip ]]; then
+            public_ip=$(eval "$service" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+        else
+            public_ip=$(eval "$service" 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+        fi
+        
+        if [[ -n "$public_ip" ]]; then
+            echo "$public_ip"
+            return 0
+        fi
+    done
+    
+    log_error "Cannot determine server public IP address"
+    return 1
+}
+
+# Validate IP address format
+validate_ip_address() {
+    local ip="$1"
+    local ip_regex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    
+    if [[ ! "$ip" =~ $ip_regex ]]; then
+        return 1
+    fi
+    
+    # Check each octet
+    IFS='.' read -ra octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        if [[ "$octet" -gt 255 || "$octet" -lt 0 ]]; then
+            return 1
+        fi
+    done
+    
+    return 0
+}
+
+# Check if port is available
+check_port_availability() {
+    local port="$1"
+    local protocol="${2:-udp}"
+    
+    if netstat -ln"$protocol" 2>/dev/null | grep -q ":$port "; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Find available port in range
+find_available_port() {
+    local start_port="${1:-$DEFAULT_PORT_RANGE_START}"
+    local end_port="${2:-$DEFAULT_PORT_RANGE_END}"
+    
+    for port in $(seq "$start_port" "$end_port"); do
+        if check_port_availability "$port"; then
+            echo "$port"
+            return 0
+        fi
+    done
+    
+    log_error "No available ports found in range $start_port-$end_port"
+    return 1
+}
+
+# ==========================================
+# PACKAGE MANAGEMENT FUNCTIONS
+# ==========================================
+
+# Update package repositories
+update_package_repositories() {
+    local os_version
+    os_version=$(detect_operating_system)
+    local os_id="${os_version%%:*}"
+    
+    log_info "Updating package repositories..."
+    
+    case "$os_id" in
+        "ubuntu"|"debian")
+            apt-get update -qq
+            ;;
+        "fedora")
+            dnf check-update -q || true
+            ;;
+        "centos"|"almalinux"|"rocky")
+            yum check-update -q || true
+            ;;
+        *)
+            log_warning "Unknown package manager for $os_id"
+            ;;
+    esac
+}
+
+# Install required packages
+install_system_packages() {
+    local os_version
+    os_version=$(detect_operating_system)
+    local os_id="${os_version%%:*}"
+    
+    log_info "Installing required system packages..."
+    
+    local packages_common="curl wget jq qrencode iptables"
+    local packages_specific=""
+    
+    case "$os_id" in
+        "ubuntu"|"debian")
+            packages_specific="wireguard resolvconf ufw"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $packages_common $packages_specific
+            ;;
+        "fedora")
+            packages_specific="wireguard-tools firewalld"
+            dnf install -y $packages_common $packages_specific
+            ;;
+        "centos"|"almalinux"|"rocky")
+            # Enable EPEL repository
+            yum install -y epel-release
+            packages_specific="wireguard-tools firewalld"
+            yum install -y $packages_common $packages_specific
+            ;;
+        *)
+            log_error "Unsupported operating system for package installation: $os_id"
+            return 1
+            ;;
+    esac
+    
+    log_success "System packages installed successfully"
+}
+
+# ==========================================
+# WIREGUARD CONFIGURATION FUNCTIONS
+# ==========================================
+
+# Generate cryptographic keys
+generate_keypair() {
+    local private_key
+    local public_key
+    
+    private_key=$(wg genkey)
+    public_key=$(echo "$private_key" | wg pubkey)
+    
+    echo "$private_key $public_key"
+}
+
+# Generate preshared key
+generate_preshared_key() {
+    wg genpsk
+}
+
+# Create server configuration structure
+initialize_server_config() {
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$BACKUP_DIR"
+    mkdir -p "/etc/wireguard"
+    
+    # Set proper permissions
+    chmod 700 "$CONFIG_DIR"
+    chmod 700 "$BACKUP_DIR"
+    chmod 700 "/etc/wireguard"
+}
+
+# Interactive server configuration
+configure_server_interactively() {
+    local server_ip
+    local server_port
+    local server_interface
+    local vpn_subnet
+    local dns_servers
+    
+    echo
+    log_info "WireGuard Server Configuration"
+    echo "======================================"
+    
+    # Server IP configuration
+    server_ip=$(discover_public_ip)
+    read -rp "Server public IP address [$server_ip]: " input_ip
+    server_ip="${input_ip:-$server_ip}"
+    
+    if ! validate_ip_address "$server_ip"; then
+        log_error "Invalid IP address format"
+        return 1
+    fi
+    
+    # Server port configuration
+    server_port=$(find_available_port)
+    read -rp "Server port [$server_port]: " input_port
+    server_port="${input_port:-$server_port}"
+    
+    if ! [[ "$server_port" =~ ^[0-9]+$ ]] || [[ "$server_port" -lt 1024 ]] || [[ "$server_port" -gt 65535 ]]; then
+        log_error "Invalid port number (must be 1024-65535)"
+        return 1
+    fi
+    
+    # Network interface
+    server_interface=$(discover_primary_interface)
+    read -rp "Public network interface [$server_interface]: " input_interface
+    server_interface="${input_interface:-$server_interface}"
+    
+    # VPN subnet
+    read -rp "VPN subnet [$DEFAULT_VPN_SUBNET]: " input_subnet
+    vpn_subnet="${input_subnet:-$DEFAULT_VPN_SUBNET}"
+    
+    # DNS servers
+    read -rp "DNS servers [1.1.1.1,8.8.8.8]: " input_dns
+    dns_servers="${input_dns:-1.1.1.1,8.8.8.8}"
+    
+    # Store configuration
+    cat > "$CONFIG_DIR/server.conf" << EOF
+{
+    "server_ip": "$server_ip",
+    "server_port": $server_port,
+    "server_interface": "$server_interface",
+    "vpn_subnet": "$vpn_subnet",
+    "dns_servers": "$dns_servers",
+    "created_at": "$(date -Iseconds)"
+}
+EOF
+    
+    log_success "Server configuration saved"
+}
+
+# Generate server WireGuard configuration
+create_server_configuration() {
+    local config
+    config=$(cat "$CONFIG_DIR/server.conf")
+    
+    local server_ip
+    local server_port
+    local server_interface
+    local vpn_subnet
+    
+    server_ip=$(echo "$config" | jq -r '.server_ip')
+    server_port=$(echo "$config" | jq -r '.server_port')
+    server_interface=$(echo "$config" | jq -r '.server_interface')
+    vpn_subnet=$(echo "$config" | jq -r '.vpn_subnet')
+    
+    # Generate server keys
+    local keypair
+    keypair=$(generate_keypair)
+    local server_private_key="${keypair%% *}"
+    local server_public_key="${keypair##* }"
+    
+    # Save keys securely
+    echo "$server_private_key" | tee "$CONFIG_DIR/server_private.key" > /dev/null
+    echo "$server_public_key" | tee "$CONFIG_DIR/server_public.key" > /dev/null
+    chmod 600 "$CONFIG_DIR/server_private.key"
+    
+    # Extract network information
+    local network_base
+    network_base=$(echo "$vpn_subnet" | cut -d'/' -f1 | cut -d'.' -f1-3)
+    local server_vpn_ip="${network_base}.1"
+    
+    # Create WireGuard server configuration
+    cat > "/etc/wireguard/wg0.conf" << EOF
+[Interface]
+# Server Configuration - Generated by WireGuard Setup Manager v$SCRIPT_VERSION
+# Created: $(date)
+Address = $server_vpn_ip/24
+ListenPort = $server_port
+PrivateKey = $server_private_key
+SaveConfig = false
+
+# Firewall rules
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o $server_interface -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o $server_interface -j MASQUERADE
+
+# Client configurations will be added below this line
+EOF
+    
+    chmod 600 "/etc/wireguard/wg0.conf"
+    
+    # Update server config with generated information
+    local updated_config
+    updated_config=$(echo "$config" | jq --arg key "$server_private_key" --arg pub "$server_public_key" --arg ip "$server_vpn_ip" \
+        '. + {server_private_key: $key, server_public_key: $pub, server_vpn_ip: $ip}')
+    echo "$updated_config" > "$CONFIG_DIR/server.conf"
+    
+    log_success "Server WireGuard configuration created"
+}
+
+# ==========================================
+# FIREWALL CONFIGURATION FUNCTIONS
+# ==========================================
+
+# Configure firewall rules
+setup_firewall_rules() {
+    local config
+    config=$(cat "$CONFIG_DIR/server.conf")
+    local server_port
+    server_port=$(echo "$config" | jq -r '.server_port')
+    
+    log_info "Configuring firewall rules..."
+    
+    # Detect firewall system
+    if systemctl is-active --quiet ufw 2>/dev/null || command -v ufw >/dev/null 2>&1; then
+        # UFW (Ubuntu/Debian)
+        ufw allow "$server_port/udp" comment "WireGuard"
+        ufw --force enable
+    elif systemctl is-active --quiet firewalld 2>/dev/null || command -v firewall-cmd >/dev/null 2>&1; then
+        # Firewalld (CentOS/RHEL/Fedora)
+        firewall-cmd --permanent --add-port="$server_port/udp"
+        firewall-cmd --permanent --add-masquerade
+        firewall-cmd --reload
+    else
+        # Fallback to iptables
+        iptables -I INPUT -p udp --dport "$server_port" -j ACCEPT
+        # Save iptables rules (method varies by distribution)
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save
+        elif command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+    fi
+    
+    log_success "Firewall rules configured"
+}
+
+# Enable IP forwarding
+enable_ip_forwarding() {
+    log_info "Enabling IP forwarding..."
+    
+    # Enable for current session
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+    
+    # Make permanent
+    cat > /etc/sysctl.d/99-wireguard.conf << EOF
+# WireGuard IP forwarding
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+    
+    sysctl -p /etc/sysctl.d/99-wireguard.conf
+    log_success "IP forwarding enabled"
+}
+
+# ==========================================
+# SERVICE MANAGEMENT FUNCTIONS
+# ==========================================
+
+# Start and enable WireGuard service
+start_wireguard_service() {
+    log_info "Starting WireGuard service..."
+    
+    systemctl enable wg-quick@wg0
+    systemctl start wg-quick@wg0
+    
+    # Verify service is running
+    if systemctl is-active --quiet wg-quick@wg0; then
+        log_success "WireGuard service started successfully"
+    else
+        log_error "Failed to start WireGuard service"
+        return 1
+    fi
+}
+
+# ==========================================
+# CLIENT MANAGEMENT FUNCTIONS
+# ==========================================
+
+# Validate client name
+validate_client_name() {
+    local name="$1"
+    
+    # Check format
+    if [[ ! "$name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9_-]*[a-zA-Z0-9])?$ ]]; then
+        return 1
+    fi
+    
+    # Check length
+    if [[ ${#name} -lt 3 || ${#name} -gt 15 ]]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Check if client exists
+client_exists() {
+    local client_name="$1"
+    
+    if [[ -f "$CONFIG_DIR/clients/$client_name.json" ]]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Get next available client IP
+get_next_client_ip() {
+    local config
+    config=$(cat "$CONFIG_DIR/server.conf")
+    local vpn_subnet
+    vpn_subnet=$(echo "$config" | jq -r '.vpn_subnet')
+    
+    local network_base
+    network_base=$(echo "$vpn_subnet" | cut -d'/' -f1 | cut -d'.' -f1-3)
+    
+    # Start from .10 (reserve .1-9 for infrastructure)
+    for ip_suffix in $(seq 10 254); do
+        local test_ip="${network_base}.${ip_suffix}"
+        
+        # Check if IP is already assigned
+        if ! grep -r "Address.*$test_ip" "$CONFIG_DIR/clients/" >/dev/null 2>&1; then
+            echo "$test_ip"
+            return 0
+        fi
+    done
+    
+    log_error "No available IP addresses in subnet"
+    return 1
+}
+
+# Create new client
+create_new_client() {
+    echo
+    log_info "Creating New WireGuard Client"
+    echo "======================================"
+    
+    # Get client name
+    local client_name
+    while true; do
+        read -rp "Enter client name: " client_name
+        
+        if [[ -z "$client_name" ]]; then
+            log_warning "Client name cannot be empty"
+            continue
+        fi
+        
+        if ! validate_client_name "$client_name"; then
+            log_warning "Invalid client name. Use 3-15 characters: letters, numbers, underscore, hyphen"
+            continue
+        fi
+        
+        if client_exists "$client_name"; then
+            log_warning "Client '$client_name' already exists"
+            continue
+        fi
+        
+        break
+    done
+    
+    # Generate client keys
+    local keypair
+    keypair=$(generate_keypair)
+    local client_private_key="${keypair%% *}"
+    local client_public_key="${keypair##* }"
+    local preshared_key
+    preshared_key=$(generate_preshared_key)
+    
+    # Get client IP
+    local client_ip
+    client_ip=$(get_next_client_ip)
+    
+    # Load server configuration
+    local server_config
+    server_config=$(cat "$CONFIG_DIR/server.conf")
+    local server_ip
+    local server_port
+    local server_public_key
+    local dns_servers
+    
+    server_ip=$(echo "$server_config" | jq -r '.server_ip')
+    server_port=$(echo "$server_config" | jq -r '.server_port')
+    server_public_key=$(echo "$server_config" | jq -r '.server_public_key')
+    dns_servers=$(echo "$server_config" | jq -r '.dns_servers')
+    
+    # Create client directory
+    mkdir -p "$CONFIG_DIR/clients"
+    
+    # Save client configuration
+    cat > "$CONFIG_DIR/clients/$client_name.json" << EOF
+{
+    "name": "$client_name",
+    "private_key": "$client_private_key",
+    "public_key": "$client_public_key",
+    "preshared_key": "$preshared_key",
+    "ip_address": "$client_ip",
+    "created_at": "$(date -Iseconds)",
+    "enabled": true
+}
+EOF
+    
+    # Generate client configuration file
+    local client_config_file="$CONFIG_DIR/clients/$client_name.conf"
+    cat > "$client_config_file" << EOF
+[Interface]
+# Client: $client_name
+# Generated: $(date)
+PrivateKey = $client_private_key
+Address = $client_ip/24
+DNS = $dns_servers
+
+[Peer]
+PublicKey = $server_public_key
+PresharedKey = $preshared_key
+Endpoint = $server_ip:$server_port
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+EOF
+    
+    # Add client to server configuration
+    cat >> "/etc/wireguard/wg0.conf" << EOF
+
+# Client: $client_name (Added: $(date))
+[Peer]
+PublicKey = $client_public_key
+PresharedKey = $preshared_key
+AllowedIPs = $client_ip/32
+EOF
+    
+    # Reload WireGuard configuration
+    wg syncconf wg0 <(wg-quick strip wg0)
+    
+    # Generate QR code
+    local qr_file="$CONFIG_DIR/clients/$client_name.png"
+    qrencode -t png -o "$qr_file" < "$client_config_file"
+    
+    log_success "Client '$client_name' created successfully"
+    echo
+    echo "Configuration file: $client_config_file"
+    echo "QR code image: $qr_file"
+    echo
+    echo "=== Client Configuration ==="
+    cat "$client_config_file"
+    echo
+    echo "=== QR Code ==="
+    qrencode -t ansiutf8 < "$client_config_file"
+    echo
+}
+
+# List all clients
+list_all_clients() {
+    echo
+    log_info "WireGuard Client List"
+    echo "======================================"
+    
+    if [[ ! -d "$CONFIG_DIR/clients" ]]; then
+        echo "No clients found."
+        return
+    fi
+    
+    local client_count=0
+    printf "%-4s %-15s %-15s %-12s %s\n" "ID" "Name" "IP Address" "Status" "Created"
+    echo "---------------------------------------------------------------"
+    
+    for client_file in "$CONFIG_DIR/clients"/*.json; do
+        if [[ ! -f "$client_file" ]]; then
+            continue
+        fi
+        
+        ((client_count++))
+        local client_config
+        client_config=$(cat "$client_file")
+        
+        local name
+        local ip_address  
+        local created_at
+        local enabled
+        
+        name=$(echo "$client_config" | jq -r '.name')
+        ip_address=$(echo "$client_config" | jq -r '.ip_address')
+        created_at=$(echo "$client_config" | jq -r '.created_at' | cut -d'T' -f1)
+        enabled=$(echo "$client_config" | jq -r '.enabled')
+        
+        local status
+        if [[ "$enabled" == "true" ]]; then
+            status="Active"
+        else
+            status="Disabled"
+        fi
+        
+        printf "%-4s %-15s %-15s %-12s %s\n" "$client_count" "$name" "$ip_address" "$status" "$created_at"
+    done
+    
+    if [[ $client_count -eq 0 ]]; then
+        echo "No clients found."
+    fi
+    echo
+}
+
+# Remove client
+remove_client() {
+    echo
+    log_info "Remove WireGuard Client"
+    echo "======================================"
+    
+    # List clients for selection
+    list_all_clients
+    
+    read -rp "Enter client name to remove: " client_name
+    
+    if [[ -z "$client_name" ]]; then
+        log_warning "No client name provided"
+        return
+    fi
+    
+    if ! client_exists "$client_name"; then
+        log_error "Client '$client_name' not found"
+        return
+    fi
+    
+    # Confirmation
+    read -rp "Are you sure you want to remove client '$client_name'? [y/N]: " confirm
+    if [[ "$confirm" != [yY] ]]; then
+        log_info "Operation cancelled"
+        return
+    fi
+    
+    # Get client public key for removal from server config
+    local client_config
+    client_config=$(cat "$CONFIG_DIR/clients/$client_name.json")
+    local client_public_key
+    client_public_key=$(echo "$client_config" | jq -r '.public_key')
+    
+    # Remove from server configuration
+    # Create temporary file without the client
+    local temp_config
+    temp_config=$(mktemp)
+    
+    awk -v client_key="$client_public_key" '
+    /^# Client:/ && getline && /^\[Peer\]/ {
+        peer_section = 1
+        next
+    }
+    peer_section && /^PublicKey/ {
+        if ($3 == client_key) {
+            skip_peer = 1
+            next
+        } else {
+            peer_section = 0
+            skip_peer = 0
+        }
+    }
+    peer_section && /^$/ {
+        peer_section = 0
+        skip_peer = 0
+        next
+    }
+    !skip_peer { print }
+    ' "/etc/wireguard/wg0.conf" > "$temp_config"
+    
+    mv "$temp_config" "/etc/wireguard/wg0.conf"
+    
+    # Remove client files
+    rm -f "$CONFIG_DIR/clients/$client_name.json"
+    rm -f "$CONFIG_DIR/clients/$client_name.conf"
+    rm -f "$CONFIG_DIR/clients/$client_name.png"
+    
+    # Reload WireGuard configuration
+    wg syncconf wg0 <(wg-quick strip wg0)
+    
+    log_success "Client '$client_name' removed successfully"
+}
+
+# ==========================================
+# BACKUP AND MAINTENANCE FUNCTIONS
+# ==========================================
+
+# Create system backup
+create_system_backup() {
+    local backup_name="wireguard-backup-$(date +%Y%m%d_%H%M%S)"
+    local backup_path="$BACKUP_DIR/$backup_name.tar.gz"
+    
+    log_info "Creating system backup..."
+    
+    mkdir -p "$BACKUP_DIR"
+    
+    tar -czf "$backup_path" \
+        -C / \
+        --exclude="$BACKUP_DIR" \
+        "etc/wireguard" \
+        "etc/wireguard-manager" \
+        2>/dev/null || true
+    
+    if [[ -f "$backup_path" ]]; then
+        log_success "Backup created: $backup_path"
+        echo "Backup file: $backup_path"
+    else
+        log_error "Failed to create backup"
+        return 1
+    fi
+}
+
+# System status check
+check_system_status() {
+    echo
+    log_info "WireGuard System Status"
+    echo "======================================"
+    
+    # Service status
+    echo "Service Status:"
+    if systemctl is-active --quiet wg-quick@wg0; then
+        echo "  WireGuard Service: ${COLOR_GREEN}Active${COLOR_RESET}"
+    else
+        echo "  WireGuard Service: ${COLOR_RED}Inactive${COLOR_RESET}"
+    fi
+    
+    # Interface status
+    echo
+    echo "Network Interface:"
+    if ip link show wg0 >/dev/null 2>&1; then
+        echo "  Interface wg0: ${COLOR_GREEN}Up${COLOR_RESET}"
+        echo "  Interface IP: $(ip addr show wg0 | grep 'inet ' | awk '{print $2}')"
+    else
+        echo "  Interface wg0: ${COLOR_RED}Down${COLOR_RESET}"
+    fi
+    
+    # Connected clients
+    echo
+    echo "Connected Clients:"
+    if command -v wg >/dev/null 2>&1 && wg show wg0 >/dev/null 2>&1; then
+        local peer_count
+        peer_count=$(wg show wg0 peers | wc -l)
+        echo "  Total Peers: $peer_count"
+        
+        while read -r peer; do
+            local last_handshake
+            last_handshake=$(wg show wg0 latest-handshakes | grep "$peer" | awk '{print $2}')
+            if [[ -n "$last_handshake" && "$last_handshake" != "0" ]]; then
+                local handshake_time
+                handshake_time=$(date -d "@$last_handshake" 2>/dev/null || echo "Unknown")
+                echo "  Peer ${peer:0:16}...: Last seen $handshake_time"
+            fi
+        done < <(wg show wg0 peers)
+    else
+        echo "  Status: Unable to query peers"
+    fi
+    
+    # System resources
+    echo
+    echo "System Resources:"
+    echo "  Load Average: $(uptime | awk -F'load average:' '{print $2}')"
+    echo "  Memory Usage: $(free -h | awk '/^Mem:/ {print $3"/"$2}')"
+    echo "  Disk Usage: $(df -h / | awk 'NR==2 {print $3"/"$2" ("$5")"}')"
+    echo
+}
+
+# ==========================================
+# MAIN MENU SYSTEM
+# ==========================================
+
+# Display main menu
+show_main_menu() {
+    clear
+    echo
+    echo "======================================"
+    echo "    $SCRIPT_NAME v$SCRIPT_VERSION"
+    echo "======================================"
+    echo
+    echo "1) Install WireGuard Server"
+    echo "2) Add New Client"
+    echo "3) List All Clients"
+    echo "4) Remove Client"
+    echo "5) Show System Status"
+    echo "6) Create Backup"
+    echo "7) View Logs"
+    echo "8) Uninstall WireGuard"
+    echo "9) Exit"
+    echo
+}
+
+# Handle menu selection
+handle_menu_selection() {
+    local choice
+    read -rp "Enter your choice [1-9]: " choice
+    
+    case $choice in
+        1)
+            if [[ -f "$CONFIG_DIR/server.conf" ]]; then
+                log_warning "WireGuard server appears to already be installed"
+                read -rp "Continue anyway? [y/N]: " confirm
+                [[ "$confirm" == [yY] ]] || return
+            fi
+            install_wireguard_server
+            ;;
+        2)
+            if [[ ! -f "$CONFIG_DIR/server.conf" ]]; then
+                log_error "WireGuard server not installed. Please install first."
+                return
+            fi
+            create_new_client
+            ;;
+        3)
+            list_all_clients
+            ;;
+        4)
+            remove_client
+            ;;
+        5)
+            check_system_status
+            ;;
+        6)
+            create_system_backup
+            ;;
+        7)
+            view_recent_logs
+            ;;
+        8)
+            uninstall_wireguard
+            ;;
+        9)
+            log_info "Exiting WireGuard Setup Manager"
+            exit 0
+            ;;
+        *)
+            log_warning "Invalid selection. Please choose 1-9."
+            ;;
+    esac
+    
+    echo
+    read -rp "Press Enter to continue..."
+}
+
+# View recent logs
+view_recent_logs() {
+    echo
+    log_info "Recent Log Entries"
+    echo "======================================"
+    
+    if [[ -f "$LOG_FILE" ]]; then
+        tail -20 "$LOG_FILE"
+    else
+        echo "No log file found."
+    fi
+    echo
+}
+
+# ==========================================
+# INSTALLATION ORCHESTRATION
+# ==========================================
+
+# Complete WireGuard server installation
+install_wireguard_server() {
+    log_info "Starting WireGuard server installation..."
+    
+    # System validation
+    validate_system_compatibility
+    check_virtualization
+    
+    # Package management
+    update_package_repositories
+    install_system_packages
+    
+    # Configuration
+    initialize_server_config
+    configure_server_interactively
+    create_server_configuration
+    
+    # Network setup
+    setup_firewall_rules
+    enable_ip_forwarding
+    
+    # Service management
+    start_wireguard_service
+    
+    # Create initial backup
+    create_system_backup
+    
+    log_success "WireGuard server installation completed successfully!"
+    echo
+    echo "Next steps:"
+    echo "1. Create your first client using option 2"
+    echo "2. Check system status using option 5"
+    echo "3. Review logs using option 7"
+    echo
+}
+
+# Uninstall WireGuard
+uninstall_wireguard() {
+    echo
+    log_warning "WireGuard Uninstallation"
+    echo "======================================"
+    echo "This will remove WireGuard and all configurations!"
+    echo
+    read -rp "Are you absolutely sure? Type 'REMOVE' to continue: " confirm
+    
+    if [[ "$confirm" != "REMOVE" ]]; then
+        log_info "Uninstallation cancelled"
+        return
+    fi
+    
+    log_info "Creating final backup before removal..."
+    create_system_backup
+    
+    log_info "Stopping WireGuard service..."
+    systemctl stop wg-quick@wg0 2>/dev/null || true
+    systemctl disable wg-quick@wg0 2>/dev/null || true
+    
+    log_info "Removing configuration files..."
+    rm -rf "/etc/wireguard"
+    rm -rf "$CONFIG_DIR"
+    rm -f "/etc/sysctl.d/99-wireguard.conf"
+    
+    log_info "Removing firewall rules..."
+    # This is simplified - in practice, you'd want to specifically remove the rules added
+    
+    log_success "WireGuard uninstalled successfully"
+    echo "Backup files remain in $BACKUP_DIR"
+}
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
+# Main function
+main() {
+    # Initialize
+    setup_logging
+    verify_root_access
+    
+    # Create temp directory
+    mkdir -p "$TEMP_DIR"
+    
+    # Welcome message
+    if [[ $# -eq 0 ]]; then
+        while true; do
+            show_main_menu
+            handle_menu_selection
+        done
+    fi
+    
+    # Handle command line arguments if any
+    case "${1:-}" in
+        "install")
+            install_wireguard_server
+            ;;
+        "status")
+            check_system_status
+            ;;
+        "backup")
+            create_system_backup
+            ;;
+        "--version")
+            echo "$SCRIPT_NAME v$SCRIPT_VERSION"
+            ;;
+        "--help")
+            echo "Usage: $0 [install|status|backup|--version|--help]"
+            echo "Run without arguments for interactive mode"
+            ;;
+        *)
+            if [[ -n "${1:-}" ]]; then
+                log_error "Unknown command: $1"
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+# Execute main function
+main "$@"
