@@ -191,24 +191,6 @@ sudo ./wireguard-install.sh backup
 
 ---
 
-## 📋 Feature Comparison
-
-| Feature | This Script | Basic Scripts | Enterprise Solutions |
-|---------|-------------|---------------|---------------------|
-| One-command install | ✅ | ✅ | ❌ |
-| Multi-OS support | ✅ | ⚠️ | ✅ |
-| Interactive menus | ✅ | ❌ | ✅ |
-| QR code generation | ✅ | ⚠️ | ✅ |
-| Automatic backups | ✅ | ❌ | ✅ |
-| JSON configuration | ✅ | ❌ | ✅ |
-| Real-time monitoring | ✅ | ❌ | ✅ |
-| Client management | ✅ | ⚠️ | ✅ |
-| Firewall integration | ✅ | ⚠️ | ✅ |
-| Error handling | ✅ | ❌ | ✅ |
-| **Price** | **Free** | **Free** | **$$$$** |
-
----
-
 ## 🔧 Advanced Configuration
 
 ### **Custom Network Settings**
@@ -340,10 +322,9 @@ We welcome contributions! Here's how you can help:
 ```
 
 ### **Getting Help:**
-- 📖 **Check our Wiki** - Comprehensive troubleshooting guide
 - 💬 **GitHub Issues** - Search existing issues first
-- 🌐 **Community Forums** - WireGuard community support
-- 📧 **Direct Support** - Available for critical issues
+- 🌐 **Discord Community**:  
+  [![Discord](https://img.shields.io/discord/4bcN48qvYa?label=Support%20Chat&logo=discord)](https://discord.gg/4bcN48qvYa)
 
 ---
 
