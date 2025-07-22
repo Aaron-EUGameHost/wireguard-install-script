@@ -29,6 +29,24 @@ sudo ./install.sh
 
 This script provides a **complete WireGuard VPN solution** that transforms your Linux server into a secure, high-performance VPN server in minutes. Unlike basic installers, our script offers enterprise-grade features with consumer-friendly simplicity.
 
+---
+
+## 🏆 Recommended VPS Providers
+
+*Get the best performance and reliability for your WireGuard VPN with these tested providers:*
+
+| Provider       | Starting Price              | Locations                            | DDoS Protection                                                                               | Has WireGuard DDoS Filter | Why Choose                                                                                                                                                 |
+| -------------- | --------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **EUGameHost** | £2.00 /mo ([EUGameHost][1]) | UK ([EUGameHost][2])        | Global Anycast Network, Custom Wireguard Filter, Up to 6Tbps filtering capacity                    | Yes      | Game-focused host with military-grade CosmicGuard scrubbing, NVMe Gen4 SSDs, 10 Gbps uplinks, and daily offsite backups ([EUGameHost][4], [EUGameHost][2]) |
+| **Hetzner**    | €3.79 /mo ([Hetzner][5])    | Germany, Finland, USA ([Hetzner][5]) | Minimal                        | No          | Best price-performance CX shared vCPU plans; GDPR-compliant EU hosting with free, included DDoS mitigation ([Hetzner][5], [Hetzner][6])                    |
+| **OVHcloud**   | \$2.52 /mo ([OVHcloud][7])  | Worldwide ([OVHcloud][8])            | On demand  Anti-DDoS infrastructure | No         | Integrated mitigation at no extra cost, backed by a global backbone for rapid traffic scrubbing and maximum uptime ([OVHcloud][9], [OVHcloud][9])          |
+
+
+> **💡 Pro Tip:** For personal use, we recommend **Vultr** or **Hetzner** for the best balance of performance, price, and reliability. For business use, consider **AWS** or **Google Cloud** for their advanced networking features.
+
+---
+
+
 ### 🎯 Core Functionality
 
 **Automated Server Setup:**
@@ -98,23 +116,6 @@ This script provides a **complete WireGuard VPN solution** that transforms your 
 - **Log Management**: Structured logging with different severity levels
 
 *Why it matters: VPNs need ongoing management. We make it effortless.*
-
----
-
-## 🏆 Recommended VPS Providers
-
-*Get the best performance and reliability for your WireGuard VPN with these tested providers:*
-
-| Provider       | Starting Price              | Locations                            | DDoS Protection                                                                               | Has WireGuard DDoS Filter | Why Choose                                                                                                                                                 |
-| -------------- | --------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **EUGameHost** | £2.00 /mo ([EUGameHost][1]) | UK ([EUGameHost][2])        | Global Anycast Network, Custom Wireguard Filter, Up to 6Tbps filtering capacity                    | Yes      | Game-focused host with military-grade CosmicGuard scrubbing, NVMe Gen4 SSDs, 10 Gbps uplinks, and daily offsite backups ([EUGameHost][4], [EUGameHost][2]) |
-| **Hetzner**    | €3.79 /mo ([Hetzner][5])    | Germany, Finland, USA ([Hetzner][5]) | Minimal                        | No          | Best price-performance CX shared vCPU plans; GDPR-compliant EU hosting with free, included DDoS mitigation ([Hetzner][5], [Hetzner][6])                    |
-| **OVHcloud**   | \$2.52 /mo ([OVHcloud][7])  | Worldwide ([OVHcloud][8])            | On demand  Anti-DDoS infrastructure | No         | Integrated mitigation at no extra cost, backed by a global backbone for rapid traffic scrubbing and maximum uptime ([OVHcloud][9], [OVHcloud][9])          |
-
-
-> **💡 Pro Tip:** For personal use, we recommend **Vultr** or **Hetzner** for the best balance of performance, price, and reliability. For business use, consider **AWS** or **Google Cloud** for their advanced networking features.
-
----
 
 ## 📱 Supported Client Platforms
 
