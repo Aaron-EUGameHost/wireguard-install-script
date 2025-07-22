@@ -20,17 +20,17 @@ WG_CONF_DIR="/etc/wireguard"
 #  Helper functions
 #-----------------------------------------------------------------------------#
 
-function require_root() {
+require_root(){
   (( EUID == 0 )) || { echo "Must be root" >&2; exit 1; }
 }
 
-function detect_os() {
+detect_os(){
   source /etc/os-release
   OS_ID=$ID
   OS_VER=${VERSION_ID%%.*}
 }
 
-function install_packages() {
+install_packages(){
   case "$OS_ID" in
     ubuntu|debian)
       apt-get update
@@ -53,17 +53,18 @@ function install_packages() {
     *)
       echo "Unsupported OS: $OS_ID" >&2
       exit 1
+      ;;
   esac
 }
 
-function enable_forwarding() {
+enable_forwarding(){
   sysctl --system <<EOF
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
 EOF
 }
 
-function reload_wg() {
+reload_wg(){
   wg syncconf "$WG_IFACE" <(wg-quick strip "$WG_IFACE")
 }
 
@@ -71,27 +72,24 @@ function reload_wg() {
 #  Server install + initial client
 #-----------------------------------------------------------------------------#
 
-function install_server() {
+install_server(){
   require_root
   detect_os
 
-  # Prompt basics
+  # -- gather settings --
   read -rp "Interface name [wg0]: " WG_IFACE
   WG_IFACE=${WG_IFACE:-wg0}
 
-  # Public IP
   LOCAL_IP=$(ip -4 addr show scope global \
     | awk '/inet/ {sub(/\/.*/,"",$2); print $2; exit}')
   [[ -n $LOCAL_IP ]] || LOCAL_IP=$(curl -fsSL https://ifconfig.co)
   read -rp "Server public IP [$LOCAL_IP]: " SERVER_IP
   SERVER_IP=${SERVER_IP:-$LOCAL_IP}
 
-  # Public NIC
   DEF_NIC=$(ip route show default | awk '/dev/ {print $5; exit}')
   read -rp "Public NIC [$DEF_NIC]: " PUB_NIC
   PUB_NIC=${PUB_NIC:-$DEF_NIC}
 
-  # Subnets, port, DNS, allowedIPs
   read -rp "VPN IPv4 subnet [10.0.0.1/24]: " WG_IPV4_NET
   WG_IPV4_NET=${WG_IPV4_NET:-10.0.0.1/24}
   read -rp "VPN IPv6 subnet (optional): " WG_IPV6_NET
@@ -102,7 +100,7 @@ function install_server() {
   read -rp "AllowedIPs [0.0.0.0/0,::/0]: " CLIENT_ALLOWED
   CLIENT_ALLOWED=${CLIENT_ALLOWED:-0.0.0.0/0,::/0}
 
-  # MTU probe
+  # MTU
   BEST_MTU=$(bash <(curl -fsSL https://raw.githubusercontent.com/nitred/nr-wg-mtu-finder/master/find-mtu.sh) --ip 1.1.1.1 \
     | awk '/Optimal MTU:/ {print $3}')
   echo "Using MTU: $BEST_MTU"
@@ -111,12 +109,11 @@ function install_server() {
   mkdir -p "$WG_CONF_DIR"
   chmod 700 "$WG_CONF_DIR"
 
-  # Keys
   SERVER_PRIV=$(wg genkey)
-  SERVER_PUB=$(echo "$SERVER_PRIV" | wg pubkey)
+  SERVER_PUB=$(echo "$SERVER_PRIV"|wg pubkey)
 
-  # Save params
-  cat > "$PARAMS_FILE" <<EOF
+  # save params including MTU
+  cat >"$PARAMS_FILE"<<EOF
 WG_IFACE=$WG_IFACE
 SERVER_IP=$SERVER_IP
 PUB_NIC=$PUB_NIC
@@ -127,9 +124,10 @@ SERVER_PRIV=$SERVER_PRIV
 SERVER_PUB=$SERVER_PUB
 CLIENT_DNS=$CLIENT_DNS
 CLIENT_ALLOWED=$CLIENT_ALLOWED
+BEST_MTU=$BEST_MTU
 EOF
 
-  # Server config
+  # write server config
   {
     echo "[Interface]"
     echo "Address = ${WG_IPV4_NET}${WG_IPV6_NET:+,${WG_IPV6_NET}}"
@@ -141,50 +139,44 @@ EOF
     echo "PostDown = iptables -D INPUT -p udp --dport $WG_PORT -j ACCEPT"
     echo "PostDown = iptables -t nat -D POSTROUTING -o $PUB_NIC -j MASQUERADE"
     echo "PostDown = iptables -D OUTPUT ! -o $WG_IFACE -m mark --mark 0 -j DROP"
-  } > "$WG_CONF_DIR/$WG_IFACE.conf"
+  } >"$WG_CONF_DIR/$WG_IFACE.conf"
 
   enable_forwarding
   systemctl enable wg-quick@"$WG_IFACE"
   systemctl start  wg-quick@"$WG_IFACE"
 
-  # Initial client
   echo "Creating initial client 'client1'..."
-  add_client "client1" "$BEST_MTU"
+  add_client client1
 }
 
 #-----------------------------------------------------------------------------#
 #  Client management
 #-----------------------------------------------------------------------------#
 
-function add_client() {
-  local name="${1:?client name}"
-  local mtu="${2:-1420}"
+add_client(){
+  name="$1"
   source "$PARAMS_FILE"
-
-  # Generate
   CL_PRIV=$(wg genkey)
-  CL_PUB=$(echo "$CL_PRIV" | wg pubkey)
+  CL_PUB=$(echo "$CL_PRIV"|wg pubkey)
   CL_PSK=$(wg genpsk)
   ENDPOINT="$SERVER_IP:$WG_PORT"
 
-  # Write client file to root
   CFG="/root/${WG_IFACE}-${name}.conf"
   {
     echo "[Interface]"
     echo "PrivateKey = $CL_PRIV"
     echo "Address    = ${WG_IPV4_NET%%/*}/32${WG_IPV6_NET:+,${WG_IPV6_NET%%/*}/128}"
     echo "DNS        = $CLIENT_DNS"
-    echo "MTU        = $mtu"
+    echo "MTU        = $BEST_MTU"
     echo
     echo "[Peer]"
-    echo "PublicKey  = $SERVER_PUB"
+    echo "PublicKey    = $SERVER_PUB"
     echo "PresharedKey = $CL_PSK"
-    echo "Endpoint   = $ENDPOINT"
-    echo "AllowedIPs = $CLIENT_ALLOWED"
-  } > "$CFG"
+    echo "Endpoint     = $ENDPOINT"
+    echo "AllowedIPs   = $CLIENT_ALLOWED"
+  } >"$CFG"
 
-  # Append server
-  cat >> "$WG_CONF_DIR/$WG_IFACE.conf" <<EOF
+  cat >>"$WG_CONF_DIR/$WG_IFACE.conf"<<EOF
 
 # Peer: $name
 [Peer]
@@ -194,15 +186,14 @@ AllowedIPs    = ${WG_IPV4_NET%%/*}/32${WG_IPV6_NET:+,${WG_IPV6_NET%%/*}/128}
 EOF
 
   reload_wg
-  echo "Client '$name' added: $CFG"
+  echo "Client '$name' added → $CFG"
 }
 
-function list_clients() {
+list_clients(){
   grep -E "^# Peer:" "$WG_CONF_DIR/$WG_IFACE.conf" | cut -d' ' -f3
 }
 
-function revoke_client() {
-  local name
+revoke_client(){
   list_clients
   read -rp "Name to revoke: " name
   sed -i "/# Peer: $name/,/^\$/d" "$WG_CONF_DIR/$WG_IFACE.conf"
@@ -211,13 +202,13 @@ function revoke_client() {
   echo "Client '$name' revoked."
 }
 
-function manage_menu() {
+manage_menu(){
   source "$PARAMS_FILE"
-  PS3="Select an action: "
-  options=("Add client" "List clients" "Revoke client" "Exit")
+  PS3="Select action: "
+  options=(Add\ client List\ clients Revoke\ client Exit)
   select opt in "${options[@]}"; do
     case $REPLY in
-      1) read -rp "New client name: " nm; add_client "$nm" "$BEST_MTU"; break;;
+      1) read -rp "New client name: " nm; add_client "$nm"; break;;
       2) list_clients; break;;
       3) revoke_client; break;;
       4) exit 0;;
@@ -227,12 +218,12 @@ function manage_menu() {
 }
 
 #-----------------------------------------------------------------------------#
-#  Main logic
+#  Main
 #-----------------------------------------------------------------------------#
 
 require_root
 if [[ -f "$PARAMS_FILE" ]]; then
-  echo "Existing WireGuard detected."
+  echo "Existing install detected."
   manage_menu
 else
   install_server
