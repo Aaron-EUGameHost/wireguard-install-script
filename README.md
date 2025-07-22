@@ -11,11 +11,6 @@
 
 ## 🚀 Quick Installation
 
-### One-Line Installation
-```bash
-curl -fsSL https://raw.githubusercontent.com/Aaron-EUGameHost/wireguard-install-script/main/install.sh | sudo bash
-```
-
 ### Step-by-Step Installation
 ```bash
 curl -O https://raw.githubusercontent.com/Aaron-EUGameHost/wireguard-install-script/main/install.sh
