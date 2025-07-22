@@ -44,10 +44,6 @@ This script provides a **complete WireGuard VPN solution** that transforms your 
 
 ---
 
-Let me know if you also want a Reddit/Discord-friendly plaintext version or want to turn this into a markdown doc for GitHub.
-
----
-
 
 ### 🎯 Core Functionality
 
