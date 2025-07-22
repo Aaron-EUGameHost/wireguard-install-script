@@ -748,7 +748,8 @@ EOF
     echo
 }
 
-# List all clients 
+
+
 
 
 # List all clients - fixed version
@@ -886,6 +887,7 @@ list_clients_fallback() {
     fi
     echo
     echo "Install 'jq' for detailed client information: apt install jq"
+}  # <-- THIS WAS THE MISSING CLOSING BRACE!
 
 # Remove client
 # Purge/Uninstall WireGuard completely
