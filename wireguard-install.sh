@@ -799,79 +799,130 @@ list_all_clients() {
 }
 
 # Remove client
-remove_client() {
+# Purge/Uninstall WireGuard completely
+purge_wireguard() {
     echo
-    log_info "Remove WireGuard Client"
-    echo "======================================"
+    log_info "Purge WireGuard Installation"
+    echo "========================================"
+    log_warning "This will completely remove WireGuard and ALL configurations!"
     
-    # List clients for selection
-    list_all_clients
+    # List what will be removed
+    echo "This will remove:"
+    echo "  - WireGuard service and configuration"
+    echo "  - All server and client configurations"
+    echo "  - All client files and QR codes"
+    echo "  - WireGuard package (optional)"
+    echo "  - Firewall rules"
+    echo
     
-    read -rp "Enter client name to remove: " client_name
-    
-    if [[ -z "$client_name" ]]; then
-        log_warning "No client name provided"
-        return
-    fi
-    
-    if ! client_exists "$client_name"; then
-        log_error "Client '$client_name' not found"
-        return
-    fi
-    
-    # Confirmation
-    read -rp "Are you sure you want to remove client '$client_name'? [y/N]: " confirm
-    if [[ "$confirm" != [yY] ]]; then
+    # Double confirmation
+    read -rp "Are you absolutely sure you want to purge WireGuard? [y/N]: " confirm1
+    if [[ "$confirm1" != [yY] ]]; then
         log_info "Operation cancelled"
         return
     fi
     
-    # Get client public key for removal from server config
-    local client_config
-    client_config=$(cat "$CONFIG_DIR/clients/$client_name.json")
-    local client_public_key
-    client_public_key=$(echo "$client_config" | jq -r '.public_key')
+    read -rp "Type 'PURGE' to confirm complete removal: " confirm2
+    if [[ "$confirm2" != "PURGE" ]]; then
+        log_info "Operation cancelled"
+        return
+    fi
     
-    # Remove from server configuration
-    # Create temporary file without the client
-    local temp_config
-    temp_config=$(mktemp)
+    log_info "Starting WireGuard purge process..."
     
-    awk -v client_key="$client_public_key" '
-    /^# Client:/ && getline && /^\[Peer\]/ {
-        peer_section = 1
-        next
-    }
-    peer_section && /^PublicKey/ {
-        if ($3 == client_key) {
-            skip_peer = 1
-            next
-        } else {
-            peer_section = 0
-            skip_peer = 0
-        }
-    }
-    peer_section && /^$/ {
-        peer_section = 0
-        skip_peer = 0
-        next
-    }
-    !skip_peer { print }
-    ' "/etc/wireguard/wg0.conf" > "$temp_config"
+    # Stop and disable WireGuard service
+    if systemctl is-active --quiet wg-quick@wg0; then
+        log_info "Stopping WireGuard service..."
+        systemctl stop wg-quick@wg0
+    fi
     
-    mv "$temp_config" "/etc/wireguard/wg0.conf"
+    if systemctl is-enabled --quiet wg-quick@wg0 2>/dev/null; then
+        log_info "Disabling WireGuard service..."
+        systemctl disable wg-quick@wg0
+    fi
     
-    # Remove client files
-    rm -f "$CONFIG_DIR/clients/$client_name.json"
-    rm -f "$CONFIG_DIR/clients/$client_name.conf"
-    rm -f "$CONFIG_DIR/clients/$client_name.png"
+    # Remove WireGuard interface if still up
+    if ip link show wg0 &>/dev/null; then
+        log_info "Bringing down WireGuard interface..."
+        wg-quick down wg0 2>/dev/null || ip link delete wg0 2>/dev/null
+    fi
     
-    # Reload WireGuard configuration
-    wg syncconf wg0 <(wg-quick strip wg0)
+    # Remove configuration files
+    log_info "Removing configuration files..."
+    rm -f /etc/wireguard/wg0.conf
+    rm -f /etc/wireguard/wg0.conf.bak
+    rm -rf /etc/wireguard/keys/
     
-    log_success "Client '$client_name' removed successfully"
+    # Remove client configuration directory
+    if [[ -d "$CONFIG_DIR" ]]; then
+        log_info "Removing client configurations..."
+        rm -rf "$CONFIG_DIR"
+    fi
+    
+    # Remove systemd override if it exists
+    rm -rf /etc/systemd/system/wg-quick@wg0.service.d/
+    
+    # Reload systemd
+    systemctl daemon-reload
+    
+    # Remove firewall rules (iptables)
+    log_info "Cleaning up firewall rules..."
+    
+    # Remove NAT rules (adjust interface as needed)
+    iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE 2>/dev/null
+    iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o ens3 -j MASQUERADE 2>/dev/null
+    iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o venet0 -j MASQUERADE 2>/dev/null
+    
+    # Remove forward rules
+    iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null
+    
+    # Remove input rules
+    iptables -D INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null
+    
+    # If using ufw, remove rules
+    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+        log_info "Removing UFW rules..."
+        ufw --force delete allow 51820/udp 2>/dev/null
+        # Remove any custom ufw rules for WireGuard subnet
+        ufw --force delete allow from 10.8.0.0/24 2>/dev/null
+    fi
+    
+    # Remove IP forwarding setting (optional - only if you're sure it was added by WireGuard)
+    read -rp "Remove IP forwarding setting? This may affect other services [y/N]: " remove_forwarding
+    if [[ "$remove_forwarding" == [yY] ]]; then
+        log_info "Removing IP forwarding..."
+        sed -i 's/^net.ipv4.ip_forward=1/#net.ipv4.ip_forward=1/' /etc/sysctl.conf 2>/dev/null
+        sysctl -w net.ipv4.ip_forward=0 2>/dev/null
+    fi
+    
+    # Optional: Remove WireGuard package
+    read -rp "Remove WireGuard package from system? [y/N]: " remove_package
+    if [[ "$remove_package" == [yY] ]]; then
+        log_info "Removing WireGuard package..."
+        
+        if command -v apt &>/dev/null; then
+            apt remove --purge -y wireguard wireguard-tools 2>/dev/null
+            apt autoremove -y 2>/dev/null
+        elif command -v yum &>/dev/null; then
+            yum remove -y wireguard-tools 2>/dev/null
+        elif command -v dnf &>/dev/null; then
+            dnf remove -y wireguard-tools 2>/dev/null
+        elif command -v pacman &>/dev/null; then
+            pacman -Rs --noconfirm wireguard-tools 2>/dev/null
+        fi
+    fi
+    
+    # Remove any remaining wireguard directories
+    rm -rf /var/lib/wireguard/ 2>/dev/null
+    rm -rf /usr/share/wireguard/ 2>/dev/null
+    
+    # Clean up any custom scripts or cron jobs (adjust paths as needed)
+    rm -f /usr/local/bin/wg-* 2>/dev/null
+    
+    log_success "WireGuard has been completely purged from the system"
+    log_info "You may want to reboot to ensure all changes take effect"
 }
-
 # ==========================================
 # BACKUP AND MAINTENANCE FUNCTIONS
 # ==========================================
