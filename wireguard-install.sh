@@ -749,115 +749,113 @@ EOF
 }
 
 # List all clients 
+
+
+# List all clients - fixed version
 list_all_clients() {
     echo
     log_info "WireGuard Client List"
     echo "======================================"
     
-    # Debug: Show what we're looking for (remove these debug lines in production)
-    echo "Debug: CONFIG_DIR = $CONFIG_DIR"
-    echo "Debug: Looking for clients in: $CONFIG_DIR/clients"
-    
+    # Check if client directory exists
     if [[ ! -d "$CONFIG_DIR/clients" ]]; then
-        log_warning "Client directory not found: $CONFIG_DIR/clients"
-        echo "No clients found."
+        echo "No clients found. Client directory does not exist."
+        echo "Directory: $CONFIG_DIR/clients"
         return
     fi
     
     # Check if jq is available
     if ! command -v jq &>/dev/null; then
-        log_warning "jq not found, using fallback method"
-        list_clients_fallback
-        return
+        log_error "jq is required but not installed. Please install jq:"
+        echo "  Ubuntu/Debian: apt install jq -y"
+        echo "  CentOS/RHEL:   yum install jq -y"
+        echo "  Fedora:        dnf install jq -y"
+        return 1
     fi
-    
-    # Debug: Show what files exist (remove in production)
-    echo "Debug: Files in client directory:"
-    ls -la "$CONFIG_DIR/clients/" 2>/dev/null || echo "Cannot list directory contents"
-    echo
     
     local client_count=0
-    printf "%-4s %-20s %-15s %-12s %s\n" "ID" "Name" "IP Address" "Status" "Created"
-    echo "-----------------------------------------------------------------------"
+    local files_found=0
     
-    # Use array to handle filenames with spaces and ensure proper globbing
-    local client_files=("$CONFIG_DIR/clients"/*.json)
+    # Count files first to handle "no files" case
+    for client_file in "$CONFIG_DIR/clients"/*.json; do
+        if [[ -f "$client_file" ]]; then
+            ((files_found++))
+        fi
+    done
     
-    # Check if any files actually exist (handle case where glob doesn't match)
-    if [[ ! -e "${client_files[0]}" ]]; then
+    if [[ $files_found -eq 0 ]]; then
         echo "No client configuration files found."
+        echo "Directory exists but is empty: $CONFIG_DIR/clients"
         return
     fi
     
-    for client_file in "${client_files[@]}"; do
-        if [[ ! -f "$client_file" ]]; then
-            continue
-        fi
+    # Print header
+    printf "%-4s %-15s %-15s %-12s %-12s %s\n" "ID" "Name" "IP Address" "Status" "Created" "File"
+    echo "---------------------------------------------------------------------------------"
+    
+    # Process each client file
+    for client_file in "$CONFIG_DIR/clients"/*.json; do
+        # Skip if not a regular file
+        [[ -f "$client_file" ]] || continue
         
-        # Debug: Show which file we're processing
-        echo "Debug: Processing file: $client_file"
-        
-        ((client_count++))
-        
-        # Check if file is readable and not empty
+        # Check if file is readable
         if [[ ! -r "$client_file" ]]; then
             log_warning "Cannot read file: $client_file"
             continue
         fi
         
+        # Check if file is not empty
         if [[ ! -s "$client_file" ]]; then
             log_warning "Empty file: $client_file"
             continue
         fi
         
+        ((client_count++))
+        
+        # Read and validate JSON
         local client_config
         if ! client_config=$(cat "$client_file" 2>/dev/null); then
-            log_warning "Failed to read file: $client_file"
+            log_warning "Failed to read: $client_file"
+            printf "%-4s %-15s %-15s %-12s %-12s %s\n" "$client_count" "ERROR" "READ_FAILED" "Unknown" "Unknown" "$(basename "$client_file")"
             continue
         fi
         
-        # Debug: Show file contents
-        echo "Debug: File contents:"
-        echo "$client_config"
-        echo
+        # Parse JSON fields with error handling
+        local name ip_address created_at enabled status
         
-        # Parse JSON with error handling
-        local name ip_address created_at enabled
+        name=$(echo "$client_config" | jq -r '.name // "unknown"' 2>/dev/null)
+        ip_address=$(echo "$client_config" | jq -r '.ip_address // "unknown"' 2>/dev/null)  
+        created_at=$(echo "$client_config" | jq -r '.created_at // "unknown"' 2>/dev/null | cut -d'T' -f1)
+        enabled=$(echo "$client_config" | jq -r '.enabled // "unknown"' 2>/dev/null)
         
-        if ! name=$(echo "$client_config" | jq -r '.name' 2>/dev/null); then
-            log_warning "Failed to parse name from: $client_file"
-            name="unknown"
+        # Handle jq failures
+        if [[ -z "$name" || "$name" == "null" ]]; then
+            name=$(basename "$client_file" .json)  # Fallback to filename
         fi
         
-        if ! ip_address=$(echo "$client_config" | jq -r '.ip_address' 2>/dev/null); then
-            log_warning "Failed to parse ip_address from: $client_file"
-            ip_address="unknown"
-        fi
+        # Determine status
+        case "$enabled" in
+            "true") status="Active" ;;
+            "false") status="Disabled" ;;
+            *) status="Unknown" ;;
+        esac
         
-        if ! created_at=$(echo "$client_config" | jq -r '.created_at' 2>/dev/null | cut -d'T' -f1); then
-            log_warning "Failed to parse created_at from: $client_file"
-            created_at="unknown"
-        fi
-        
-        if ! enabled=$(echo "$client_config" | jq -r '.enabled' 2>/dev/null); then
-            log_warning "Failed to parse enabled from: $client_file"
-            enabled="unknown"
-        fi
-        
-        local status
-        if [[ "$enabled" == "true" ]]; then
-            status="Active"
-        elif [[ "$enabled" == "false" ]]; then
-            status="Disabled"
-        else
-            status="Unknown"
-        fi
-        
-        printf "%-4s %-20s %-15s %-12s %s\n" "$client_count" "$name" "$ip_address" "$status" "$created_at"
+        # Display client info
+        printf "%-4s %-15s %-15s %-12s %-12s %s\n" \
+            "$client_count" \
+            "${name:0:14}" \
+            "${ip_address:0:14}" \
+            "$status" \
+            "${created_at:0:11}" \
+            "$(basename "$client_file")"
     done
     
+    echo
     if [[ $client_count -eq 0 ]]; then
         echo "No valid client configurations found."
+        echo "Files exist but could not be parsed."
+    else
+        echo "Total clients: $client_count"
     fi
     echo
 }
