@@ -748,20 +748,128 @@ EOF
     echo
 }
 
-# List all clients
+# List all clients 
 list_all_clients() {
     echo
     log_info "WireGuard Client List"
     echo "======================================"
     
+    # Debug: Show what we're looking for (remove these debug lines in production)
+    echo "Debug: CONFIG_DIR = $CONFIG_DIR"
+    echo "Debug: Looking for clients in: $CONFIG_DIR/clients"
+    
     if [[ ! -d "$CONFIG_DIR/clients" ]]; then
+        log_warning "Client directory not found: $CONFIG_DIR/clients"
         echo "No clients found."
         return
     fi
     
+    # Check if jq is available
+    if ! command -v jq &>/dev/null; then
+        log_warning "jq not found, using fallback method"
+        list_clients_fallback
+        return
+    fi
+    
+    # Debug: Show what files exist (remove in production)
+    echo "Debug: Files in client directory:"
+    ls -la "$CONFIG_DIR/clients/" 2>/dev/null || echo "Cannot list directory contents"
+    echo
+    
     local client_count=0
-    printf "%-4s %-15s %-15s %-12s %s\n" "ID" "Name" "IP Address" "Status" "Created"
-    echo "---------------------------------------------------------------"
+    printf "%-4s %-20s %-15s %-12s %s\n" "ID" "Name" "IP Address" "Status" "Created"
+    echo "-----------------------------------------------------------------------"
+    
+    # Use array to handle filenames with spaces and ensure proper globbing
+    local client_files=("$CONFIG_DIR/clients"/*.json)
+    
+    # Check if any files actually exist (handle case where glob doesn't match)
+    if [[ ! -e "${client_files[0]}" ]]; then
+        echo "No client configuration files found."
+        return
+    fi
+    
+    for client_file in "${client_files[@]}"; do
+        if [[ ! -f "$client_file" ]]; then
+            continue
+        fi
+        
+        # Debug: Show which file we're processing
+        echo "Debug: Processing file: $client_file"
+        
+        ((client_count++))
+        
+        # Check if file is readable and not empty
+        if [[ ! -r "$client_file" ]]; then
+            log_warning "Cannot read file: $client_file"
+            continue
+        fi
+        
+        if [[ ! -s "$client_file" ]]; then
+            log_warning "Empty file: $client_file"
+            continue
+        fi
+        
+        local client_config
+        if ! client_config=$(cat "$client_file" 2>/dev/null); then
+            log_warning "Failed to read file: $client_file"
+            continue
+        fi
+        
+        # Debug: Show file contents
+        echo "Debug: File contents:"
+        echo "$client_config"
+        echo
+        
+        # Parse JSON with error handling
+        local name ip_address created_at enabled
+        
+        if ! name=$(echo "$client_config" | jq -r '.name' 2>/dev/null); then
+            log_warning "Failed to parse name from: $client_file"
+            name="unknown"
+        fi
+        
+        if ! ip_address=$(echo "$client_config" | jq -r '.ip_address' 2>/dev/null); then
+            log_warning "Failed to parse ip_address from: $client_file"
+            ip_address="unknown"
+        fi
+        
+        if ! created_at=$(echo "$client_config" | jq -r '.created_at' 2>/dev/null | cut -d'T' -f1); then
+            log_warning "Failed to parse created_at from: $client_file"
+            created_at="unknown"
+        fi
+        
+        if ! enabled=$(echo "$client_config" | jq -r '.enabled' 2>/dev/null); then
+            log_warning "Failed to parse enabled from: $client_file"
+            enabled="unknown"
+        fi
+        
+        local status
+        if [[ "$enabled" == "true" ]]; then
+            status="Active"
+        elif [[ "$enabled" == "false" ]]; then
+            status="Disabled"
+        else
+            status="Unknown"
+        fi
+        
+        printf "%-4s %-20s %-15s %-12s %s\n" "$client_count" "$name" "$ip_address" "$status" "$created_at"
+    done
+    
+    if [[ $client_count -eq 0 ]]; then
+        echo "No valid client configurations found."
+    fi
+    echo
+}
+
+# Fallback function when jq is not available
+list_clients_fallback() {
+    echo "Using fallback method (without jq)..."
+    echo
+    
+    local client_count=0
+    printf "%-4s %-20s %s\n" "ID" "Name" "File"
+    echo "-----------------------------------------------"
     
     for client_file in "$CONFIG_DIR/clients"/*.json; do
         if [[ ! -f "$client_file" ]]; then
@@ -769,34 +877,17 @@ list_all_clients() {
         fi
         
         ((client_count++))
-        local client_config
-        client_config=$(cat "$client_file")
+        local basename_file
+        basename_file=$(basename "$client_file" .json)
         
-        local name
-        local ip_address  
-        local created_at
-        local enabled
-        
-        name=$(echo "$client_config" | jq -r '.name')
-        ip_address=$(echo "$client_config" | jq -r '.ip_address')
-        created_at=$(echo "$client_config" | jq -r '.created_at' | cut -d'T' -f1)
-        enabled=$(echo "$client_config" | jq -r '.enabled')
-        
-        local status
-        if [[ "$enabled" == "true" ]]; then
-            status="Active"
-        else
-            status="Disabled"
-        fi
-        
-        printf "%-4s %-15s %-15s %-12s %s\n" "$client_count" "$name" "$ip_address" "$status" "$created_at"
+        printf "%-4s %-20s %s\n" "$client_count" "$basename_file" "$client_file"
     done
     
     if [[ $client_count -eq 0 ]]; then
-        echo "No clients found."
+        echo "No client files found."
     fi
     echo
-}
+    echo "Install 'jq' for detailed client information: apt install jq"
 
 # Remove client
 # Purge/Uninstall WireGuard completely
